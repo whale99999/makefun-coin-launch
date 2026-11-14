@@ -10,7 +10,7 @@
 // Outside the grader's container, MAKEFUN_BOT_DIR and MAKEFUN_OUTPUT_DIR stand in for /bot and /output:
 //   mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out node main.ts
 
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? '/bot';
@@ -23,3 +23,11 @@ try {
   console.error(`LAUNCH.json could not be copied from ${BOT_DIR}: ${(err as Error).message}`);
   process.exit(1);
 }
+
+// Verify the hand-in before reporting success: the copy must parse and name a mint.
+const handedIn = JSON.parse(readFileSync(join(OUTPUT_DIR, 'LAUNCH.json'), 'utf8'));
+if (typeof handedIn.mint !== 'string' || handedIn.mint.length < 32) {
+  console.error('LAUNCH.json in the output does not name a mint');
+  process.exit(1);
+}
+console.log(`entry ready: mint ${handedIn.mint}`);

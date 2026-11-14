@@ -1,10 +1,20 @@
-// make.fun coin launch (makefun-coin-launch-01) — pump.fun create, fully autonomous.
+// Launch program for the make.fun coin-launch bounty entry "MakeFun Ghost" (GHOST).
+// Creates a coin on pump.fun (Solana mainnet) with a hand-built create instruction,
+// then records the mint and the create signature in LAUNCH.json for the entry.
+//
 // Modes:
-//   --check             print pubkey + balance only (no writes, no tx)
-//   --prepare-metadata  upload logo+metadata to pump.fun IPFS, save metadata.json
-//   --fire              create the coin on pump.fun, write launch-repo/LAUNCH.json + launch-state.json
+//   --check   print the payer pubkey and its SOL balance, nothing else
+//   --fire    create the coin: simulate, broadcast, confirm by HTTP polling,
+//             then write launch-repo/LAUNCH.json and coinlaunch/launch-state.json
+//
+// Two fixes are baked in from the first live launch on 14 Nov 2026:
+//   1. The mint keypair is saved to disk BEFORE broadcasting, so a dropped
+//      confirmation can never lose the mint address again.
+//   2. Confirmation polls getSignatureStatuses over plain HTTPS. Websocket
+//      subscriptions die behind this machine's egress proxy (wss EPROTO),
+//      which made confirmTransaction time out on a transaction that had
+//      in fact already finalized.
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import {
   Connection, Keypair, PublicKey, SystemProgram, SYSVAR_RENT_PUBKEY,
   Transaction, TransactionInstruction,
@@ -21,15 +31,40 @@ const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 const MPL_METADATA = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 const NAME = 'MakeFun Ghost';
 const SYMBOL = 'GHOST';
-const DESCRIPTION = 'Launched autonomously by an AI agent. made for make.fun $1000 bounty';
-const MIN_BALANCE = 30_000_000; // 0.03 SOL gate
+const MIN_BALANCE = 30_000_000; // 0.03 SOL gate before firing
+// Anchor discriminator of pump.fun `create`, read from the program's on-chain IDL.
+// The instruction takes four arguments: name, symbol, uri, creator (a pubkey).
+const CREATE_DISC = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]);
 
 function loadPayer() {
   const raw = JSON.parse(fs.readFileSync(WALLET_FILE, 'utf8'));
-  const kp = Array.isArray(raw) ? Keypair.fromSecretKey(Uint8Array.from(raw)) : null;
-  if (!kp) throw new Error('wallet format not recognised');
-  if (kp.publicKey.toBase58() !== EXPECTED_PUBKEY) throw new Error('pubkey mismatch: ' + kp.publicKey.toBase58());
+  if (!Array.isArray(raw)) throw new Error('wallet format not recognised');
+  const kp = Keypair.fromSecretKey(Uint8Array.from(raw));
+  if (kp.publicKey.toBase58() !== EXPECTED_PUBKEY) {
+    throw new Error('pubkey mismatch: ' + kp.publicKey.toBase58());
+  }
   return kp;
+}
+
+function borshString(s) {
+  const b = Buffer.from(s, 'utf8');
+  const len = Buffer.alloc(4);
+  len.writeUInt32LE(b.length);
+  return Buffer.concat([len, b]);
+}
+
+async function pollConfirmed(conn, sig, timeoutMs = 120_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+    if (st) {
+      if (st.err) throw new Error('transaction failed on chain: ' + JSON.stringify(st.err));
+      if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') return st;
+    }
+    // 1.5 s between polls: tight enough for a race, gentle enough for the public RPC.
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  throw new Error('confirmation timed out (poll the signature before re-firing)');
 }
 
 const mode = process.argv[2] || '--check';
@@ -39,34 +74,22 @@ const payer = loadPayer();
 if (mode === '--check') {
   const bal = await conn.getBalance(payer.publicKey);
   console.log(JSON.stringify({ pubkey: payer.publicKey.toBase58(), lamports: bal, sol: bal / 1e9 }));
-} else if (mode === '--prepare-metadata') {
-  const img = fs.readFileSync(DIR + '/ghost.png');
-  const form = new FormData();
-  form.append('file', new Blob([img], { type: 'image/png' }), 'mark-1024.png');
-  form.append('name', NAME);
-  form.append('symbol', SYMBOL);
-  form.append('description', DESCRIPTION);
-  form.append('twitter', '');
-  form.append('telegram', '');
-  form.append('website', '');
-  form.append('showName', 'true');
-  const res = await fetch('https://pump.fun/api/ipfs', { method: 'POST', body: form });
-  const text = await res.text();
-  console.log('ipfs status', res.status);
-  if (!res.ok) { console.error(text.slice(0, 500)); process.exit(1); }
-  const j = JSON.parse(text);
-  if (!j.metadataUri) { console.error('no metadataUri in response', text.slice(0, 500)); process.exit(1); }
-  fs.writeFileSync(DIR + '/metadata.json', JSON.stringify({ metadataUri: j.metadataUri, name: NAME, symbol: SYMBOL, description: DESCRIPTION }, null, 2));
-  console.log('metadataUri', j.metadataUri);
 } else if (mode === '--fire') {
   const stateFile = DIR + '/launch-state.json';
-  if (fs.existsSync(stateFile)) { console.log('ALREADY LAUNCHED', fs.readFileSync(stateFile, 'utf8')); process.exit(0); }
+  if (fs.existsSync(stateFile)) {
+    console.log('ALREADY LAUNCHED', fs.readFileSync(stateFile, 'utf8'));
+    process.exit(0);
+  }
   const meta = JSON.parse(fs.readFileSync(DIR + '/metadata.json', 'utf8'));
   const bal = await conn.getBalance(payer.publicKey);
   console.log('balance lamports', bal);
   if (bal < MIN_BALANCE) { console.log('INSUFFICIENT_BALANCE'); process.exit(2); }
 
+  // Save the mint keypair first: from here on the mint survives any crash.
   const mint = Keypair.generate();
+  fs.writeFileSync(DIR + '/mint-keypair.json', JSON.stringify(Array.from(mint.secretKey)), { mode: 0o600 });
+  console.log('mint', mint.publicKey.toBase58());
+
   const [mintAuthority] = PublicKey.findProgramAddressSync([Buffer.from('mint-authority')], PUMP_PROGRAM);
   const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mint.publicKey.toBuffer()], PUMP_PROGRAM);
   const associatedBondingCurve = getAssociatedTokenAddressSync(mint.publicKey, bondingCurve, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
@@ -74,10 +97,13 @@ if (mode === '--check') {
   const [metadata] = PublicKey.findProgramAddressSync([Buffer.from('metadata'), MPL_METADATA.toBuffer(), mint.publicKey.toBuffer()], MPL_METADATA);
   const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from('__event_authority')], PUMP_PROGRAM);
 
-  const disc = crypto.createHash('sha256').update('global:create').digest().subarray(0, 8);
-  const str = (s) => { const b = Buffer.from(s, 'utf8'); const len = Buffer.alloc(4); len.writeUInt32LE(b.length); return Buffer.concat([len, b]); };
-  const data = Buffer.concat([disc, str(NAME), str(SYMBOL), str(meta.metadataUri), payer.publicKey.toBuffer()]);
-
+  const data = Buffer.concat([
+    CREATE_DISC,
+    borshString(NAME),
+    borshString(SYMBOL),
+    borshString(meta.metadataUri),
+    payer.publicKey.toBuffer(),
+  ]);
   const keys = [
     { pubkey: mint.publicKey, isSigner: true, isWritable: true },
     { pubkey: mintAuthority, isSigner: false, isWritable: false },
@@ -94,23 +120,26 @@ if (mode === '--check') {
     { pubkey: eventAuthority, isSigner: false, isWritable: false },
     { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
   ];
-  const ix = new TransactionInstruction({ programId: PUMP_PROGRAM, keys, data });
-  const tx = new Transaction().add(ix);
+  const tx = new Transaction().add(new TransactionInstruction({ programId: PUMP_PROGRAM, keys, data }));
   tx.feePayer = payer.publicKey;
   tx.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash;
   tx.sign(payer, mint);
-  const raw = tx.serialize();
-  // Simulate first; only broadcast if simulation is clean.
+
+  // Simulate first; broadcast only on a clean simulation.
   const sim = await conn.simulateTransaction(tx);
-  if (sim.value.err) { console.error('SIMULATION FAILED', JSON.stringify(sim.value.err), (sim.value.logs || []).slice(-8)); process.exit(3); }
-  const sig = await conn.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 3 });
+  if (sim.value.err) {
+    console.error('SIMULATION FAILED', JSON.stringify(sim.value.err), (sim.value.logs || []).slice(-8));
+    process.exit(3);
+  }
+  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
   console.log('sent', sig);
-  const conf = await conn.confirmTransaction(sig, 'confirmed');
-  if (conf.value.err) { console.error('TX FAILED ON CHAIN', JSON.stringify(conf.value.err)); process.exit(4); }
+  await pollConfirmed(conn, sig);
+
   const out = { mint: mint.publicKey.toBase58(), create_signature: sig };
-  fs.writeFileSync(DIR + '/launch-repo/LAUNCH.json', JSON.stringify(out, null, 2));
+  fs.writeFileSync(DIR + '/launch-repo/LAUNCH.json', JSON.stringify(out, null, 2) + '\n');
   fs.writeFileSync(stateFile, JSON.stringify({ ...out, ts: new Date().toISOString() }, null, 2));
   console.log('LAUNCHED', JSON.stringify(out));
 } else {
-  console.error('unknown mode', mode); process.exit(1);
+  console.error('unknown mode', mode);
+  process.exit(1);
 }
